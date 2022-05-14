@@ -6,7 +6,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"net/http"
 	"os"
+	"time"
 
 	vision "cloud.google.com/go/vision/apiv1"
 	"github.com/gofiber/fiber/v2"
@@ -20,10 +25,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/polly"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/transcribe"
+	"github.com/aws/aws-sdk-go-v2/service/transcribe/types"
 )
 
 const (
-	BODY_LIMIT int = 10 * 1024 * 1024
+	BODY_LIMIT                      int = 10 * 1024 * 1024
+	MAX_TRANSCRIPTION_JOB_WAIT_SECS int = 30
 )
 
 type ReadBody struct {
@@ -62,6 +70,16 @@ type S3ObjectKeyResponse struct {
 	Key string `json:"key"`
 }
 
+type TranscribeBody struct {
+	Key                  string `json:"key"`
+	MediaFormat          string `json:"mediaFormat"`
+	MediaSampleRateHertz int32  `json:"mediaSampleRateHertz"`
+}
+
+type TranscribeResponse struct {
+	Transcript string `json:"transcript"`
+}
+
 func randomHex(n int) (string, error) {
 	bytes := make([]byte, n)
 	if _, err := rand.Read(bytes); err != nil {
@@ -91,7 +109,7 @@ func main() {
 	}
 	s3Client := s3.NewFromConfig(awsCfg)
 	pollyClient := polly.NewFromConfig(awsCfg)
-
+	transcribeClient := transcribe.NewFromConfig(awsCfg)
 	app := fiber.New(fiber.Config{
 		BodyLimit: BODY_LIMIT,
 	})
@@ -249,7 +267,49 @@ func main() {
 		}
 		return c.SendStatus(fiber.StatusOK)
 	})
-	app.Post("/speak", func(c *fiber.Ctx) error {
+	app.Post("/transcribe", func(c *fiber.Ctx) error {
+		body := &TranscribeBody{}
+		err := c.BodyParser(body)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(NewErrorResponse(err.Error()))
+		}
+		transcribeClient.StartTranscriptionJob(c.Context(), &transcribe.StartTranscriptionJobInput{
+			TranscriptionJobName: &body.Key,
+			LanguageCode:         types.LanguageCodeEnUs,
+			MediaSampleRateHertz: aws.Int32(body.MediaSampleRateHertz),
+			MediaFormat:          types.MediaFormat(body.MediaFormat),
+			Media: &types.Media{
+				MediaFileUri: aws.String(fmt.Sprintf("s3://%s/%s", os.Getenv("BUCKET_NAME"), body.Key)),
+			},
+		})
+		for i := 0; i < MAX_TRANSCRIPTION_JOB_WAIT_SECS; i++ {
+			job, err := transcribeClient.GetTranscriptionJob(c.Context(), &transcribe.GetTranscriptionJobInput{
+				TranscriptionJobName: &body.Key,
+			})
+			if err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(NewErrorResponse(err.Error()))
+			}
+			if job.TranscriptionJob.TranscriptionJobStatus == types.TranscriptionJobStatusCompleted {
+				uri := *job.TranscriptionJob.Transcript.TranscriptFileUri
+				resp, err := http.Get(uri)
+				if err != nil {
+					return c.Status(fiber.StatusInternalServerError).JSON(NewErrorResponse(err.Error()))
+				}
+				defer resp.Body.Close()
+				body, err := ioutil.ReadAll(resp.Body)
+				if err != nil {
+					return c.Status(fiber.StatusInternalServerError).JSON(NewErrorResponse(err.Error()))
+				}
+				j := make(map[string]any)
+				err = json.Unmarshal(body, &j)
+				if err != nil {
+					return c.Status(fiber.StatusInternalServerError).JSON(NewErrorResponse(err.Error()))
+				}
+				c.Status(fiber.StatusOK).JSON(j)
+				break
+			}
+			time.Sleep(1 * time.Second)
+		}
 		return nil
 	})
 	app.Listen(":3000")

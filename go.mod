@@ -8,6 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.15.5
 	github.com/aws/aws-sdk-go-v2/service/polly v1.15.1
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.26.9
+	github.com/aws/aws-sdk-go-v2/service/transcribe v1.19.2
 	github.com/gofiber/fiber/v2 v2.31.0
 	github.com/joho/godotenv v1.4.0
 	go.mongodb.org/mongo-driver v1.9.1
