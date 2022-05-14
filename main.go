@@ -43,6 +43,25 @@ type Card struct {
 	Image string             `json:"image" bson:"image"`
 }
 
+type ErrorResponse struct {
+	Message     string   `json:"message"`
+	AltMessages []string `json:"altMessages"`
+}
+
+func NewErrorResponse(message string, altMessages ...string) *ErrorResponse {
+	if altMessages == nil {
+		altMessages = make([]string, 0)
+	}
+	return &ErrorResponse{
+		Message:     message,
+		AltMessages: altMessages,
+	}
+}
+
+type S3ObjectKeyResponse struct {
+	Key string `json:"key"`
+}
+
 func randomHex(n int) (string, error) {
 	bytes := make([]byte, n)
 	if _, err := rand.Read(bytes); err != nil {
@@ -54,13 +73,22 @@ func randomHex(n int) (string, error) {
 func main() {
 	godotenv.Load()
 
-	mongoClient, _ := mongo.Connect(context.Background(), options.Client().ApplyURI(
+	mongoClient, err := mongo.Connect(context.Background(), options.Client().ApplyURI(
 		os.Getenv("MONGO_URI"),
 	))
+	if err != nil {
+		panic(err)
+	}
 	defer mongoClient.Disconnect(context.Background())
-	visionClient, _ := vision.NewImageAnnotatorClient(context.Background())
+	visionClient, err := vision.NewImageAnnotatorClient(context.Background())
+	if err != nil {
+		panic(err)
+	}
 	defer visionClient.Close()
-	awsCfg, _ := config.LoadDefaultConfig(context.Background(), config.WithRegion("ap-southeast-1"))
+	awsCfg, err := config.LoadDefaultConfig(context.Background(), config.WithRegion("ap-southeast-1"))
+	if err != nil {
+		panic(err)
+	}
 	s3Client := s3.NewFromConfig(awsCfg)
 	pollyClient := polly.NewFromConfig(awsCfg)
 
@@ -76,76 +104,140 @@ func main() {
 			card.Id = primitive.NewObjectID()
 		}
 		coll := mongoClient.Database("db").Collection("card-sets")
-		coll.InsertOne(c.Context(), cardSet)
-		return nil
+		_, err := coll.InsertOne(c.Context(), cardSet)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(NewErrorResponse(err.Error()))
+		}
+		return c.Status(fiber.StatusOK).JSON(cardSet)
 	})
 	cardSets.Get("/", func(c *fiber.Ctx) error {
 		coll := mongoClient.Database("db").Collection("card-sets")
-		cur, _ := coll.Find(c.Context(), bson.D{})
+		cur, err := coll.Find(c.Context(), bson.D{})
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"message": err.Error(),
+			})
+		}
 		result := []*CardSet{}
 		for cur.Next(c.Context()) {
 			cardSet := &CardSet{}
-			cur.Decode(cardSet)
+			err = cur.Decode(cardSet)
+			if err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(NewErrorResponse(err.Error()))
+			}
 			result = append(result, cardSet)
 		}
-		return c.JSON(result)
+		return c.Status(fiber.StatusOK).JSON(result)
 	})
 	cardSets.Get("/:id", func(c *fiber.Ctx) error {
+		objId, err := primitive.ObjectIDFromHex(c.Params("id"))
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(NewErrorResponse(err.Error()))
+		}
 		coll := mongoClient.Database("db").Collection("card-sets")
-		objId, _ := primitive.ObjectIDFromHex(c.Params("id"))
 		result := coll.FindOne(c.Context(), bson.M{"_id": bson.M{"$eq": objId}})
 		cardSet := &CardSet{}
-		result.Decode(cardSet)
-		return c.JSON(cardSet)
+		err = result.Decode(cardSet)
+		if err != nil {
+			return c.Status(fiber.StatusNotFound).JSON(NewErrorResponse(err.Error(), "the card set was not found"))
+		}
+		return c.Status(fiber.StatusOK).JSON(cardSet)
 	})
 	cardSets.Put("/:id", func(c *fiber.Ctx) error {
 		cardSet := &CardSet{}
 		c.BodyParser(cardSet)
 		id := c.Params("id")
-		objId, _ := primitive.ObjectIDFromHex(id)
+		objId, err := primitive.ObjectIDFromHex(id)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(NewErrorResponse(err.Error()))
+		}
 		cardSet.Id = objId
 		for _, card := range cardSet.Cards {
 			card.Id = primitive.NewObjectID()
 		}
 		coll := mongoClient.Database("db").Collection("card-sets")
-		coll.ReplaceOne(c.Context(), bson.M{"_id": bson.M{"$eq": objId}}, cardSet)
-		return nil
+		result, err := coll.ReplaceOne(c.Context(), bson.M{"_id": bson.M{"$eq": objId}}, cardSet)
+		if result.MatchedCount == 0 {
+			return c.Status(fiber.StatusInternalServerError).JSON(NewErrorResponse("the card set was not found"))
+		}
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(NewErrorResponse(err.Error()))
+		}
+		return c.Status(fiber.StatusOK).JSON(cardSet)
 	})
 	cardSets.Delete("/:id", func(c *fiber.Ctx) error {
-		cardSet := &CardSet{}
-		c.BodyParser(cardSet)
 		id := c.Params("id")
-		objId, _ := primitive.ObjectIDFromHex(id)
+		objId, err := primitive.ObjectIDFromHex(id)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(NewErrorResponse(err.Error()))
+		}
 		coll := mongoClient.Database("db").Collection("card-sets")
-		coll.DeleteOne(c.Context(), bson.M{"_id": bson.M{"$eq": objId}})
-		return nil
+		result, err := coll.DeleteOne(c.Context(), bson.M{"_id": bson.M{"$eq": objId}})
+		if result.DeletedCount == 0 {
+			return c.Status(fiber.StatusInternalServerError).JSON(NewErrorResponse("the card set was not found"))
+		}
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(NewErrorResponse(err.Error()))
+		}
+		return c.SendStatus(fiber.StatusOK)
 	})
 	app.Post("/label", func(c *fiber.Ctx) error {
-		fileHeader, _ := c.FormFile("image")
-		file, _ := fileHeader.Open()
+		fileHeader, err := c.FormFile("image")
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(NewErrorResponse(err.Error()))
+		}
+		file, err := fileHeader.Open()
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(NewErrorResponse(err.Error()))
+		}
 		defer file.Close()
-		image, _ := vision.NewImageFromReader(file)
-		labels, _ := visionClient.DetectLabels(c.Context(), image, nil, 10)
-		c.Status(fiber.StatusOK).JSON(labels)
-		return nil
+		image, err := vision.NewImageFromReader(file)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(NewErrorResponse(err.Error()))
+		}
+		labels, err := visionClient.DetectLabels(c.Context(), image, nil, 10)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(NewErrorResponse(err.Error()))
+		}
+		return c.Status(fiber.StatusOK).JSON(labels)
 	})
 	app.Post("/upload", func(c *fiber.Ctx) error {
-		fileHeader, _ := c.FormFile("file")
-		file, _ := fileHeader.Open()
-		key, _ := randomHex(16)
-		s3Client.PutObject(c.Context(), &s3.PutObjectInput{
+		fileHeader, err := c.FormFile("file")
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(NewErrorResponse(err.Error()))
+		}
+		file, err := fileHeader.Open()
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(NewErrorResponse(err.Error()))
+		}
+		key, err := randomHex(16)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(NewErrorResponse(err.Error()))
+		}
+		_, err = s3Client.PutObject(c.Context(), &s3.PutObjectInput{
 			Body:   file,
 			Bucket: aws.String(os.Getenv("BUCKET_NAME")),
 			Key:    aws.String(key),
 		})
-		return c.SendString(key)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(NewErrorResponse(err.Error()))
+		}
+		return c.Status(fiber.StatusOK).JSON(&S3ObjectKeyResponse{
+			Key: key,
+		})
 	})
 	app.Post("/read", func(c *fiber.Ctx) error {
 		body := &ReadBody{}
-		c.BodyParser(body)
-		response, _ := pollyClient.SynthesizeSpeech(c.Context(), &polly.SynthesizeSpeechInput{
+		err := c.BodyParser(body)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(NewErrorResponse(err.Error()))
+		}
+		response, err := pollyClient.SynthesizeSpeech(c.Context(), &polly.SynthesizeSpeechInput{
 			Text: &body.Text, OutputFormat: "mp3", VoiceId: "Joanna",
 		})
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(NewErrorResponse(err.Error()))
+		}
 		buf := make([]byte, 64)
 		c.Set("Content-Type", "audio/mp3")
 		for {
@@ -155,7 +247,7 @@ func main() {
 			}
 			c.Write(buf[:n])
 		}
-		return nil
+		return c.SendStatus(fiber.StatusOK)
 	})
 	app.Post("/speak", func(c *fiber.Ctx) error {
 		return nil
