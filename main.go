@@ -73,13 +73,22 @@ func randomHex(n int) (string, error) {
 func main() {
 	godotenv.Load()
 
-	mongoClient, _ := mongo.Connect(context.Background(), options.Client().ApplyURI(
+	mongoClient, err := mongo.Connect(context.Background(), options.Client().ApplyURI(
 		os.Getenv("MONGO_URI"),
 	))
+	if err != nil {
+		panic(err)
+	}
 	defer mongoClient.Disconnect(context.Background())
-	visionClient, _ := vision.NewImageAnnotatorClient(context.Background())
+	visionClient, err := vision.NewImageAnnotatorClient(context.Background())
+	if err != nil {
+		panic(err)
+	}
 	defer visionClient.Close()
-	awsCfg, _ := config.LoadDefaultConfig(context.Background(), config.WithRegion("ap-southeast-1"))
+	awsCfg, err := config.LoadDefaultConfig(context.Background(), config.WithRegion("ap-southeast-1"))
+	if err != nil {
+		panic(err)
+	}
 	s3Client := s3.NewFromConfig(awsCfg)
 	pollyClient := polly.NewFromConfig(awsCfg)
 
