@@ -332,8 +332,8 @@ func main() {
 		req := &speechpb.LongRunningRecognizeRequest{
 			// TODO: Check audio config from front-end
 			Config: &speechpb.RecognitionConfig{
-				Encoding:        speechpb.RecognitionConfig_ENCODING_UNSPECIFIED,
-				SampleRateHertz: 22050,
+				Encoding:        speechpb.RecognitionConfig_WEBM_OPUS,
+				SampleRateHertz: 48000,
 				LanguageCode:    "en-US",
 			},
 			Audio: &speechpb.RecognitionAudio{
