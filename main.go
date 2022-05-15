@@ -1,7 +1,5 @@
 package main
 
-//go:generate mockgen -source=main.go -destination=mock_main/mock_gen.go
-
 import (
 	"context"
 	"crypto/rand"
@@ -21,12 +19,14 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 
+	speech "cloud.google.com/go/speech/apiv1"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/polly"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/transcribe"
 	"github.com/aws/aws-sdk-go-v2/service/transcribe/types"
+	speechpb "google.golang.org/genproto/googleapis/cloud/speech/v1"
 )
 
 const (
@@ -76,10 +76,6 @@ type TranscribeBody struct {
 	MediaSampleRateHertz int32  `json:"mediaSampleRateHertz"`
 }
 
-type TranscribeResponse struct {
-	Transcript string `json:"transcript"`
-}
-
 func randomHex(n int) (string, error) {
 	bytes := make([]byte, n)
 	if _, err := rand.Read(bytes); err != nil {
@@ -109,7 +105,13 @@ func main() {
 	}
 	s3Client := s3.NewFromConfig(awsCfg)
 	pollyClient := polly.NewFromConfig(awsCfg)
-	transcribeClient := transcribe.NewFromConfig(awsCfg)
+	transcribeClient := transcribe.NewFromConfig(awsCfg)        // aws
+	speechClient, err := speech.NewClient(context.Background()) // google
+	if err != nil {
+		panic(err)
+	}
+	defer speechClient.Close()
+
 	app := fiber.New(fiber.Config{
 		BodyLimit: BODY_LIMIT,
 	})
@@ -267,6 +269,7 @@ func main() {
 		}
 		return c.SendStatus(fiber.StatusOK)
 	})
+	// Decprecated
 	app.Post("/transcribe", func(c *fiber.Ctx) error {
 		body := &TranscribeBody{}
 		err := c.BodyParser(body)
@@ -312,5 +315,40 @@ func main() {
 		}
 		return nil
 	})
-	app.Listen(":3000")
+	app.Post("/transcribe-v2", func(c *fiber.Ctx) error {
+		fileHeader, err := c.FormFile("audio")
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(NewErrorResponse(err.Error()))
+		}
+		file, err := fileHeader.Open()
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(NewErrorResponse(err.Error()))
+		}
+		defer file.Close()
+		fileContent, err := ioutil.ReadAll(file)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(NewErrorResponse(err.Error()))
+		}
+		req := &speechpb.LongRunningRecognizeRequest{
+			// TODO: Check audio config from front-end
+			Config: &speechpb.RecognitionConfig{
+				Encoding:        speechpb.RecognitionConfig_ENCODING_UNSPECIFIED,
+				SampleRateHertz: 22050,
+				LanguageCode:    "en-US",
+			},
+			Audio: &speechpb.RecognitionAudio{
+				AudioSource: &speechpb.RecognitionAudio_Content{Content: fileContent},
+			},
+		}
+		op, err := speechClient.LongRunningRecognize(c.Context(), req)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(NewErrorResponse(err.Error()))
+		}
+		resp, err := op.Wait(c.Context())
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(NewErrorResponse(err.Error()))
+		}
+		return c.JSON(resp.Results)
+	})
+	app.Listen(os.Getenv("PORT"))
 }
